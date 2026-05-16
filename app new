@@ -1,0 +1,713 @@
+// --- MAIN APPLICATION ENTRY  ---
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:vibration/vibration.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:fl_chart/fl_chart.dart'; // REQUIRED: flutter pub add fl_chart
+import 'dart:async';
+import 'firebase_options.dart';
+
+final ValueNotifier<ThemeMode> themeNotifier = ValueNotifier(ThemeMode.light);
+final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+
+  const AndroidInitializationSettings initializationSettingsAndroid =
+  AndroidInitializationSettings('@mipmap/ic_launcher');
+  const InitializationSettings initializationSettings =
+  InitializationSettings(android: initializationSettingsAndroid);
+
+  await flutterLocalNotificationsPlugin.initialize(initializationSettings);
+
+  await flutterLocalNotificationsPlugin
+      .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+      ?.requestNotificationsPermission();
+
+  _setupBackgroundNotificationListener();
+
+  final prefs = await SharedPreferences.getInstance();
+  final String? savedRole = prefs.getString('userRole');
+  runApp(NoiseMonitorApp(initialRole: savedRole));
+}
+
+bool _isBreakTime() {
+  final now = DateTime.now();
+  final timeVal = now.hour * 100 + now.minute;
+  return (timeVal >= 1030 && timeVal <= 1045) || (timeVal >= 1300 && timeVal <= 1400);
+}
+
+Future<void> _sendNotification(String title, String body) async {
+  const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
+    'noise_alerts_channel',
+    'Classroom Noise Alerts',
+    importance: Importance.max,
+    priority: Priority.high,
+    showWhen: true,
+  );
+  const NotificationDetails platformDetails = NotificationDetails(android: androidDetails);
+  await flutterLocalNotificationsPlugin.show(
+      DateTime.now().millisecond, title, body, platformDetails);
+}
+
+void _setupBackgroundNotificationListener() {
+  double dynamicA2 = 60.0;
+  double dynamicA3 = 80.0;
+
+  FirebaseFirestore.instance
+      .collection('system_settings')
+      .doc('config')
+      .snapshots()
+      .listen((doc) {
+    if (doc.exists) {
+      dynamicA2 = (doc.data()?['alert2_thresh'] ?? 60.0).toDouble();
+      dynamicA3 = (doc.data()?['alert3_thresh'] ?? 80.0).toDouble();
+    }
+  });
+
+  FirebaseDatabase.instance.ref('classroom_status/S6_CS_B').onValue.listen((event) async {
+    if (event.snapshot.value == null) return;
+    final Map data = event.snapshot.value as Map;
+
+    int db = (data['decibels'] ?? 0).toInt();
+    bool isUnlocked = data['isUnlocked'] ?? false;
+
+    if (isUnlocked || _isBreakTime() || db <= 0) return;
+
+    final prefs = await SharedPreferences.getInstance();
+    String role = prefs.getString('userRole') ?? "";
+
+    if (db >= dynamicA3) {
+      if (role == "Teacher" || role == "HOD" || role == "SuperAdmin") {
+        _sendNotification("SEVERE ALERT 🚨", "Extreme noise violation: $db dB in S6 CS B");
+      }
+    } else if (db >= dynamicA2) {
+      if (role == "Teacher") {
+        _sendNotification("CRITICAL ALERT ⚠️", "Noise level exceeded: $db dB");
+      }
+    }
+  });
+}
+
+class NoiseMonitorApp extends StatelessWidget {
+  final String? initialRole;
+  const NoiseMonitorApp({super.key, this.initialRole});
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeNotifier,
+      builder: (_, mode, __) {
+        return MaterialApp(
+          debugShowCheckedModeBanner: false,
+          themeMode: mode,
+          theme: ThemeData(useMaterial3: true, colorSchemeSeed: const Color(0xFF5369E4)),
+          darkTheme: ThemeData(useMaterial3: true, brightness: Brightness.dark, colorSchemeSeed: const Color(0xFF5369E4)),
+          home: initialRole != null ? AllInOneHomePage(userRole: initialRole!) : const LoginPage(),
+        );
+      },
+    );
+  }
+}
+
+// --- 1. LOGIN PAGE ---
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _isLoading = false;
+
+  void _login() async {
+    setState(() => _isLoading = true);
+    try {
+      final configDoc = await FirebaseFirestore.instance.collection('system_settings').doc('config').get();
+      bool isBlocked = configDoc.data()?['block_${_emailController.text.trim()}'] ?? false;
+
+      if (isBlocked) {
+        if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Access Blocked")));
+        setState(() => _isLoading = false);
+        return;
+      }
+
+      String role = "";
+      
+      // Fallback for SuperAdmin or first time use
+      if (_emailController.text.trim() == "Admin@123" && _passwordController.text == "password") {
+         role = "SuperAdmin";
+      } else {
+        // Dynamic fetch from 'users' collection
+        var userDocs = await FirebaseFirestore.instance.collection('users')
+            .where('email', isEqualTo: _emailController.text.trim())
+            .where('password', isEqualTo: _passwordController.text)
+            .get();
+
+        if (userDocs.docs.isNotEmpty) {
+          role = userDocs.docs.first.data()['role'] ?? "";
+        }
+      }
+
+      if (role.isNotEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('userRole', role);
+        if(mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => AllInOneHomePage(userRole: role)));
+      } else {
+        if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Invalid Credentials")));
+      }
+    } catch (e) {
+      if(mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Error: $e")));
+    }
+    if(mounted) setState(() => _isLoading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: const BoxDecoration(gradient: LinearGradient(colors: [Color(0xFF5369E4), Color(0xFF2E3B8E)])),
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(30.0),
+            child: Card(
+              child: Padding(
+                padding: const EdgeInsets.all(30.0),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.settings_input_antenna_rounded, size: 70, color: Color(0xFF5369E4)),
+                    const Text("ClassRoom Monitor", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    TextField(controller: _emailController, decoration: const InputDecoration(labelText: 'Faculty Email / ID')),
+                    TextField(controller: _passwordController, obscureText: true, decoration: const InputDecoration(labelText: 'Password')),
+                    const SizedBox(height: 30),
+                    SizedBox(width: double.infinity, child: ElevatedButton(
+                      onPressed: _isLoading ? null : _login, 
+                      child: _isLoading ? const CircularProgressIndicator() : const Text("ENTER DASHBOARD"))),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// --- 2. HOMEPAGE ---
+class AllInOneHomePage extends StatefulWidget {
+  final String userRole;
+  const AllInOneHomePage({super.key, required this.userRole});
+  @override
+  State<AllInOneHomePage> createState() => _AllInOneHomePageState();
+}
+
+class _AllInOneHomePageState extends State<AllInOneHomePage> {
+  String _currentView = "Dashboard";
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(_currentView)),
+      drawer: Drawer(
+        child: Column(
+          children: [
+            UserAccountsDrawerHeader(
+                decoration: const BoxDecoration(color: Color(0xFF5369E4)),
+                accountName: Text(widget.userRole),
+                accountEmail: const Text("VJCET CS Dept")
+            ),
+            ListTile(leading: const Icon(Icons.dashboard_outlined), title: const Text('Live Monitoring'), onTap: () { Navigator.pop(context); setState(() => _currentView = "Dashboard"); }),
+            ListTile(leading: const Icon(Icons.notifications_none, color: Colors.orange), title: const Text('Recent Alerts'), onTap: () { Navigator.pop(context); setState(() => _currentView = "Alerts"); }),
+            ListTile(leading: const Icon(Icons.calendar_today_outlined), title: const Text('Weekly Timetable'), onTap: () { Navigator.pop(context); setState(() => _currentView = "Timetable"); }),
+            ListTile(leading: const Icon(Icons.person_search_outlined), title: const Text('Faculty Directory'), onTap: () { Navigator.pop(context); setState(() => _currentView = "Teachers"); }),
+            if (widget.userRole == "SuperAdmin")
+              ListTile(leading: const Icon(Icons.admin_panel_settings_outlined, color: Colors.purple), title: const Text('System Control'), onTap: () { Navigator.pop(context); setState(() => _currentView = "Control"); }),
+            const Spacer(),
+            ListTile(leading: const Icon(Icons.logout, color: Colors.red), title: const Text('Logout'), onTap: () async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.remove('userRole');
+              if(mounted) Navigator.pushReplacement(context, MaterialPageRoute(builder: (context) => const LoginPage()));
+            }),
+          ],
+        ),
+      ),
+      body: _buildBody(),
+    );
+  }
+
+  Widget _buildBody() {
+    switch (_currentView) {
+      case "Timetable": return TimetableWidget(userRole: widget.userRole);
+      case "Teachers": return TeachersListWidget(userRole: widget.userRole);
+      case "Alerts": return const AlertsPage();
+      case "Control": return const AdminControlWidget();
+      default: return NoiseAlertDashboard(userRole: widget.userRole);
+    }
+  }
+}
+
+// --- 3. DASHBOARD WITH LIVE GRAPH ---
+class NoiseAlertDashboard extends StatefulWidget {
+  final String userRole;
+  const NoiseAlertDashboard({super.key, required this.userRole});
+
+  @override
+  State<NoiseAlertDashboard> createState() => _NoiseAlertDashboardState();
+}
+
+class _NoiseAlertDashboardState extends State<NoiseAlertDashboard> {
+  StreamSubscription? _sub;
+  int _db = 0;
+  bool _isUnlocked = false;
+  bool _isPresent = false;
+  
+  final List<FlSpot> _dataPoints = [];
+  double _timeCounter = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    // Fill initial line to avoid empty chart crashes
+    for (int i = 0; i < 30; i++) {
+        _dataPoints.add(FlSpot(i.toDouble(), 0));
+    }
+    _timeCounter = 30.0;
+
+    _sub = FirebaseDatabase.instance.ref('classroom_status/S6_CS_B').onValue.listen((event) {
+      if (!mounted) return;
+      if (event.snapshot.value == null) return;
+      final Map data = event.snapshot.value as Map;
+      int db = (data['decibels'] ?? 0).toInt();
+      
+      setState(() {
+         _db = db;
+         _isUnlocked = data['isUnlocked'] ?? false;
+         _isPresent = data['isTeacherPresent'] ?? false;
+         
+         // Graph Sliding Window Logic
+         _dataPoints.add(FlSpot(_timeCounter, db.toDouble()));
+         _dataPoints.removeAt(0);
+         _timeCounter += 1;
+      });
+      _runInAppLogic(db, _isUnlocked);
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  void _runInAppLogic(int db, bool isUnlocked) {
+    if (isUnlocked || _isBreakTime() || db <= 0) return;
+    if (db >= 60 && widget.userRole == "Teacher") {
+      Vibration.vibrate(duration: 400);
+    }
+    if (db >= 80) {
+      FirebaseFirestore.instance.collection('management_alerts').add({
+        'room': 'S6 CS B', 'level': db, 'timestamp': FieldValue.serverTimestamp(),
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Expanded(
+          flex: 4,
+          child: Center(
+            child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  if (_isBreakTime()) const Chip(label: Text("BREAK TIME - PAUSED"), backgroundColor: Colors.orangeAccent),
+                  const Icon(Icons.graphic_eq, size: 40, color: Colors.blueGrey),
+                  Text("$_db dB",
+                      style: TextStyle(
+                          fontSize: 100,
+                          fontWeight: FontWeight.bold,
+                          color: _isUnlocked ? Colors.grey : (_db >= 60 ? Colors.red : const Color(0xFF5369E4))
+                      )),
+                  Chip(
+                    backgroundColor: _isPresent ? Colors.green.shade100 : Colors.red.shade100,
+                    label: Text(_isPresent ? "FACULTY PRESENT" : "ROOM UNSUPERVISED"),
+                  ),
+                  if (_isUnlocked) const Text("Alerts Muted by RFID", style: TextStyle(color: Colors.grey)),
+                ]
+            ),
+          ),
+        ),
+        const Divider(),
+        const Padding(
+          padding: EdgeInsets.all(8.0),
+          child: Text("LIVE NOISE METRICS", style: TextStyle(fontWeight: FontWeight.bold)),
+        ),
+        Expanded(
+          flex: 2,
+          child: Padding(
+            padding: const EdgeInsets.only(right: 20.0, left: 10, bottom: 20),
+            child: LineChart(
+              LineChartData(
+                minY: 0,
+                maxY: 120, // Max DB
+                minX: _timeCounter - 30, // Sliding window
+                maxX: _timeCounter,
+                lineBarsData: [
+                  LineChartBarData(
+                    spots: _dataPoints,
+                    isCurved: true,
+                    color: Colors.blueAccent,
+                    barWidth: 3,
+                    isStrokeCapRound: true,
+                    dotData: const FlDotData(show: false),
+                    belowBarData: BarAreaData(show: true, color: Colors.blueAccent.withOpacity(0.2)),
+                  ),
+                ],
+                titlesData: const FlTitlesData(
+                  topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                  bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                  rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                ),
+                gridData: const FlGridData(show: true, drawVerticalLine: false),
+                borderData: FlBorderData(show: false),
+              ),
+            ),
+          ),
+        )
+      ],
+    );
+  }
+}
+
+// --- 4. ALERTS PAGE ---
+class AlertsPage extends StatelessWidget {
+  const AlertsPage({super.key});
+
+  String _formatDateTime(dynamic timestamp) {
+    if (timestamp == null) return "Just now";
+    DateTime dt = (timestamp as Timestamp).toDate();
+    String hour = dt.hour > 12 ? (dt.hour - 12).toString() : (dt.hour == 0 ? "12" : dt.hour.toString());
+    String minute = dt.minute.toString().padLeft(2, '0');
+    String ampm = dt.hour >= 12 ? "PM" : "AM";
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return "${months[dt.month - 1]} ${dt.day}, $hour:$minute $ampm";
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot>(
+      stream: FirebaseFirestore.instance.collection('management_alerts').orderBy('timestamp', descending: true).limit(20).snapshots(),
+      builder: (context, snap) {
+        if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+        return ListView.builder(
+            itemCount: snap.data!.docs.length,
+            itemBuilder: (c, i) {
+              var data = snap.data!.docs[i].data() as Map<String, dynamic>;
+              return Card(
+                margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: ListTile(
+                  leading: const Icon(Icons.warning, color: Colors.red),
+                  title: Text("High Noise: ${data['level']} dB", style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: Text("Room: ${data['room']}\nTime: ${_formatDateTime(data['timestamp'])}"),
+                  isThreeLine: true,
+                ),
+              );
+            }
+        );
+      },
+    );
+  }
+}
+
+// --- 5. TIMETABLE WIDGET (Dynamic & Editable) ---
+class TimetableWidget extends StatelessWidget {
+  final String userRole;
+  const TimetableWidget({super.key, required this.userRole});
+
+  void _addPeriodDialog(BuildContext context, String dayId) {
+    final pc = TextEditingController();
+    final sc = TextEditingController();
+    final fc = TextEditingController();
+    showDialog(context: context, builder: (context) => AlertDialog(
+      title: Text("Add Period for $dayId"),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(controller: pc, decoration: const InputDecoration(labelText: "Period (e.g. 1)")),
+          TextField(controller: sc, decoration: const InputDecoration(labelText: "Subject")),
+          TextField(controller: fc, decoration: const InputDecoration(labelText: "Faculty Name")),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: ()=>Navigator.pop(context), child: const Text("CANCEL")),
+        TextButton(onPressed: () {
+          FirebaseFirestore.instance.collection('timetable').doc(dayId).set({
+            'periods': FieldValue.arrayUnion([
+              {'p': pc.text, 's': sc.text, 'f': fc.text}
+            ])
+          }, SetOptions(merge: true));
+          Navigator.pop(context);
+        }, child: const Text("SAVE")),
+      ]
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    bool canEdit = (userRole == "HOD" || userRole == "Teacher");
+
+    return DefaultTabController(
+      length: 5,
+      child: Column(
+        children: [
+          const TabBar(
+            isScrollable: true,
+            labelColor: Color(0xFF5369E4),
+            tabs: [Tab(text: "Mon"), Tab(text: "Tue"), Tab(text: "Wed"), Tab(text: "Thu"), Tab(text: "Fri")],
+          ),
+          Expanded(
+            child: TabBarView(
+              children: ["Mon", "Tue", "Wed", "Thu", "Fri"].map((day) {
+                return StreamBuilder<DocumentSnapshot>(
+                  stream: FirebaseFirestore.instance.collection('timetable').doc(day).snapshots(),
+                  builder: (context, snapshot) {
+                     if(!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+                     List periods = [];
+                     if(snapshot.data!.exists) {
+                       periods = (snapshot.data!.data() as Map)['periods'] ?? [];
+                     }
+
+                     return Scaffold(
+                        body: ListView.builder(
+                          itemCount: periods.length,
+                          padding: const EdgeInsets.all(10),
+                          itemBuilder: (context, index) {
+                            var p = periods[index];
+                            return Dismissible(
+                              key: UniqueKey(),
+                              direction: canEdit ? DismissDirection.endToStart : DismissDirection.none,
+                              background: Container(color: Colors.red, alignment: Alignment.centerRight, padding: const EdgeInsets.only(right: 20), child: const Icon(Icons.delete, color: Colors.white)),
+                              onDismissed: (dir) {
+                                FirebaseFirestore.instance.collection('timetable').doc(day).update({
+                                  'periods': FieldValue.arrayRemove([p])
+                                });
+                              },
+                              child: Card(
+                                child: ListTile(
+                                  leading: CircleAvatar(backgroundColor: const Color(0xFF5369E4), child: Text(p['p'].toString(), style: const TextStyle(color: Colors.white, fontSize: 12))),
+                                  title: Text(p['s'].toString(), style: const TextStyle(fontWeight: FontWeight.bold)),
+                                  subtitle: Text("Faculty: ${p['f']}"),
+                                ),
+                              )
+                            );
+                          }
+                        ),
+                        floatingActionButton: canEdit 
+                          ? FloatingActionButton(onPressed: () => _addPeriodDialog(context, day), child: const Icon(Icons.add)) 
+                          : null,
+                     );
+                  }
+                );
+              }).toList(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// --- 6. FACULTY LIST (Dynamic & Editable for HOD) ---
+class TeachersListWidget extends StatelessWidget {
+  final String userRole;
+  const TeachersListWidget({super.key, required this.userRole});
+
+  void _addFacultyDialog(BuildContext context) {
+    final nC = TextEditingController();
+    final cC = TextEditingController();
+    showDialog(context: context, builder: (context) => AlertDialog(
+      title: const Text("Add New Faculty"),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(controller: nC, decoration: const InputDecoration(labelText: "Full Name")),
+          TextField(controller: cC, decoration: const InputDecoration(labelText: "Short Code (e.g. AG)")),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: ()=>Navigator.pop(context), child: const Text("CANCEL")),
+        TextButton(onPressed: () {
+          FirebaseFirestore.instance.collection('faculty').add({
+            'name': nC.text, 'code': cC.text
+          });
+          Navigator.pop(context);
+        }, child: const Text("ADD")),
+      ]
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance.collection('faculty').orderBy('name').snapshots(),
+        builder: (context, snap) {
+          if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+          return ListView.builder(
+            itemCount: snap.data!.docs.length,
+            padding: const EdgeInsets.all(10),
+            itemBuilder: (context, index) {
+              var data = snap.data!.docs[index].data() as Map<String, dynamic>;
+              String docId = snap.data!.docs[index].id;
+              
+              return Card(
+                child: ListTile(
+                  leading: CircleAvatar(backgroundColor: Colors.indigo.shade100, child: Text(data['code'] ?? 'NA')),
+                  title: Text(data['name'] ?? '', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  subtitle: const Text("VJCET Computer Science Dept"),
+                  trailing: userRole == "HOD" ? IconButton(
+                    icon: const Icon(Icons.delete, color: Colors.red),
+                    onPressed: () => FirebaseFirestore.instance.collection('faculty').doc(docId).delete(),
+                  ) : null,
+                ),
+              );
+            }
+          );
+        }
+      ),
+      floatingActionButton: userRole == "HOD" ? 
+        FloatingActionButton(onPressed: ()=>_addFacultyDialog(context), child: const Icon(Icons.person_add)) : null,
+    );
+  }
+}
+
+// --- 7. ADMIN CONTROL (Thresholds + User Management) ---
+class AdminControlWidget extends StatelessWidget {
+  const AdminControlWidget({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text("HARDWARE THRESHOLDS", style: TextStyle(fontWeight: FontWeight.bold)),
+        StreamBuilder<DocumentSnapshot>(
+          stream: FirebaseFirestore.instance.collection('system_settings').doc('config').snapshots(),
+          builder: (context, snapshot) {
+            if (!snapshot.hasData) return const CircularProgressIndicator();
+            var data = snapshot.data!.data() as Map<String, dynamic>? ?? {};
+            double a2 = (data['alert2_thresh'] ?? 60.0).toDouble();
+            double a3 = (data['alert3_thresh'] ?? 80.0).toDouble();
+            
+            return Column(
+              children: [
+                _slider("Teacher Alert (Vibrate)", a2, Colors.orange, (v) => _update('alert2_thresh', v)),
+                _slider("Severe Alert (HOD)", a3, Colors.red, (v) => _update('alert3_thresh', v)),
+              ],
+            );
+          },
+        ),
+        const SizedBox(height: 30),
+        const Text("USER & CREDENTIAL MANAGEMENT", style: TextStyle(fontWeight: FontWeight.bold)),
+        ListTile(
+          tileColor: Colors.purple.shade50,
+          leading: const Icon(Icons.manage_accounts, color: Colors.purple),
+          title: const Text("Manage Teachers & HODs"),
+          subtitle: const Text("Add/Edit Usernames and Passwords"),
+          trailing: const Icon(Icons.arrow_forward_ios),
+          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const UserManagementScreen())),
+        )
+      ],
+    );
+  }
+  
+  void _update(String field, double val) => FirebaseFirestore.instance.collection('system_settings').doc('config').set({field: val}, SetOptions(merge: true));
+  Widget _slider(String t, double v, Color c, Function(double) f) => Card(child: Column(children: [ListTile(title: Text(t), trailing: Text("${v.toInt()} dB")), Slider(value: v, min: 40, max: 110, activeColor: c, onChanged: f)]));
+}
+
+// --- 8. ADMIN USER MANAGEMENT SCREEN ---
+class UserManagementScreen extends StatelessWidget {
+  const UserManagementScreen({super.key});
+
+  void _userDialog(BuildContext context, {DocumentSnapshot? existingDoc}) {
+    final eC = TextEditingController(text: existingDoc?['email'] ?? '');
+    final pC = TextEditingController(text: existingDoc?['password'] ?? '');
+    String selectedRole = existingDoc?['role'] ?? 'Teacher';
+
+    showDialog(context: context, builder: (context) => StatefulBuilder(
+      builder: (context, setState) {
+        return AlertDialog(
+          title: Text(existingDoc == null ? "Add User" : "Edit User"),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: eC, decoration: const InputDecoration(labelText: "Email/ID")),
+              TextField(controller: pC, decoration: const InputDecoration(labelText: "Password")),
+              DropdownButton<String>(
+                value: selectedRole,
+                items: ['Teacher', 'HOD', 'SuperAdmin'].map((r) => DropdownMenuItem(value: r, child: Text(r))).toList(),
+                onChanged: (v) => setState(() => selectedRole = v!),
+              )
+            ],
+          ),
+          actions: [
+            if (existingDoc != null) TextButton(
+               onPressed: () { existingDoc.reference.delete(); Navigator.pop(context); }, 
+               child: const Text("DELETE", style: TextStyle(color: Colors.red))
+            ),
+            TextButton(
+               onPressed: () {
+                 final data = {'email': eC.text.trim(), 'password': pC.text, 'role': selectedRole};
+                 if(existingDoc == null) FirebaseFirestore.instance.collection('users').add(data);
+                 else existingDoc.reference.update(data);
+                 Navigator.pop(context);
+               }, 
+               child: const Text("SAVE")
+            ),
+          ]
+        );
+      }
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text("User Management")),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance.collection('users').snapshots(),
+        builder: (context, snap) {
+           if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+           return ListView.builder(
+             itemCount: snap.data!.docs.length,
+             itemBuilder: (context, index) {
+               var doc = snap.data!.docs[index];
+               return Card(
+                 child: ListTile(
+                   leading: CircleAvatar(child: Icon(doc['role'] == 'HOD' ? Icons.star : Icons.person)),
+                   title: Text(doc['email']),
+                   subtitle: Text("Role: ${doc['role']} | Pass: ${doc['password']}"), // Showing pass only to Admin
+                   trailing: const Icon(Icons.edit),
+                   onTap: () => _userDialog(context, existingDoc: doc),
+                 )
+               );
+             }
+           );
+        }
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () => _userDialog(context),
+        child: const Icon(Icons.person_add),
+      ),
+    );
+  }
+}
