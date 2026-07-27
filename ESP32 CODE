@@ -1,0 +1,130 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+
+// --- 1. CREDENTIALS ---
+#define WIFI_SSID "Project" 
+#define WIFI_PASSWORD "12345678" 
+#define API_KEY "AIzaSyBfYdF3ahOvRvxJ3gDT2puN1veoEFcahjA"
+#define DATABASE_URL "https://trial-76c2f-default-rtdb.firebaseio.com/" // <--- Your RTDB URL
+#define PROJECT_ID "trial-76c2f"
+
+// --- 2. PIN DEFINITIONS ---
+#define SS_PIN 8 
+#define RST_PIN 20 
+#define RFID_LED_PIN 4   
+#define SOUND_LED_PIN 1  
+#define BUTTON_PIN 3
+#define SENSOR_PIN 0    
+
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+FirebaseData fbdo;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+// System State
+bool isUnlocked = false; 
+const int sampleWindow = 50;
+int dbThreshold = 55; 
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUTTON_PIN, INPUT);
+  pinMode(RFID_LED_PIN, OUTPUT);
+  pinMode(SOUND_LED_PIN, OUTPUT); 
+  analogReadResolution(12);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi Connected!");
+
+  // --- RTDB CONFIGURATION ---
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  
+  // Use Database Secrets/Legacy Token for instant access
+  config.signer.tokens.legacy_token = "PLnxohjnF9jvCglKYlpH89LwrHt0IoNui3LfwDBQ"; 
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  SPI.begin(9, 5, 6, 8); 
+  mfrc522.PCD_Init();
+  Serial.println(F("--- RTDB SYSTEM ACTIVE ---"));
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    runSoundSensorLogic();
+    if (!isUnlocked) checkRFID();
+    if (isUnlocked) checkButtonLogic();
+  }
+}
+
+void runSoundSensorLogic() {
+  unsigned long startMillis = millis();
+  unsigned int signalMax = 0;
+  unsigned int signalMin = 4095;
+
+  while (millis() - startMillis < sampleWindow) {
+    unsigned int sample = analogRead(SENSOR_PIN);
+    if (sample < 4096) {
+      if (sample > signalMax) signalMax = sample;
+      else if (sample < signalMin) signalMin = sample;
+    }
+  }
+
+  unsigned int peakToPeak = signalMax - signalMin;
+  int db = map(peakToPeak, 20, 1000, 35, 95); 
+  db = constrain(db, 30, 100);
+
+  Serial.print("dB: ");
+  Serial.print(db);
+
+  // --- SENDING TO REALTIME DATABASE ---
+  if (Firebase.RTDB.setInt(&fbdo, "/classroom_status/S6_CS_B/decibels", db)) {
+    Serial.println(" | RTDB: SUCCESS");
+  } else {
+    Serial.print(" | RTDB: FAIL | ");
+    Serial.println(fbdo.errorReason());
+  }
+
+  // LED logic remains purely local for now
+  if (db >= dbThreshold) {
+    digitalWrite(SOUND_LED_PIN, HIGH);
+  } else {
+    digitalWrite(SOUND_LED_PIN, LOW);
+  }
+}
+
+void checkRFID() {
+  if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+    isUnlocked = true;
+    
+    // 1. Update the existing teacher flag
+    Firebase.RTDB.setBool(&fbdo, "/classroom_status/S6_CS_B/isTeacherPresent", true);
+    
+    // 2. ADD THIS LINE: This tells the App to MUTE notifications
+    Firebase.RTDB.setBool(&fbdo, "/classroom_status/S6_CS_B/isUnlocked", true);
+    
+    digitalWrite(RFID_LED_PIN, HIGH); delay(500); digitalWrite(RFID_LED_PIN, LOW);
+    mfrc522.PICC_HaltA();
+  }
+}
+
+void checkButtonLogic() {
+  // If your button is connected to GND, use (digitalRead(BUTTON_PIN) == LOW)
+  if (digitalRead(BUTTON_PIN) == HIGH) { 
+    isUnlocked = false;
+    
+    // 1. Update the existing teacher flag
+    Firebase.RTDB.setBool(&fbdo, "/classroom_status/S6_CS_B/isTeacherPresent", false);
+    
+    // 2. ADD THIS LINE: This tells the App to RESUME notifications
+    Firebase.RTDB.setBool(&fbdo, "/classroom_status/S6_CS_B/isUnlocked", false);
+    
+    digitalWrite(RFID_LED_PIN, HIGH); delay(1000); digitalWrite(RFID_LED_PIN, LOW);
+  }
+}
